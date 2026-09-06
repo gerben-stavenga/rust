@@ -1429,6 +1429,7 @@ symbols! {
         new_octal,
         new_pointer,
         new_range,
+        new_typed_descriptor,
         new_unchecked,
         new_upper_exp,
         new_upper_hex,
