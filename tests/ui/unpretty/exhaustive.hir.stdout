@@ -389,8 +389,14 @@ mod expressions {
         format_arguments::from_str("");
         {
             super let args = (&expr,);
-            super let args = [format_argument::new_display(args.0)];
-            unsafe { format_arguments::new(b"\xc0\x00", &args) }
+            super let fmt_values = [format_argument::new(args.0)];
+            unsafe {
+                format_arguments::new(format_arguments::new_descriptor(format_argument::prepend::<1,
+                                0>(format_argument::new_display(args.0), ()),
+                        const
+                                &format_arguments::new_typed_descriptor::<_, 2,
+                                            1>(b"\xc0\x00")), &fmt_values)
+            }
         };
     }
 }
