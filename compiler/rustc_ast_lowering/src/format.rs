@@ -4,8 +4,9 @@ use rustc_ast::*;
 use rustc_data_structures::fx::FxIndexMap;
 use rustc_hir as hir;
 use rustc_hir::attrs::lang_items::LangItem;
+use rustc_middle::span_bug;
 use rustc_session::config::FmtDebug;
-use rustc_span::{ByteSymbol, DesugaringKind, Ident, Span, Symbol, sym};
+use rustc_span::{DesugaringKind, Ident, Span, Symbol, sym};
 
 use super::LoweringContext;
 
@@ -223,7 +224,7 @@ enum ArgumentType {
     Usize,
 }
 
-/// Generate a hir expression representing an argument to a format_args invocation.
+/// Generate a zero-sized marker carrying an argument's type and formatting trait.
 ///
 /// Generates:
 ///
@@ -254,10 +255,137 @@ fn make_argument<'hir>(
             Format(Binary) => sym::new_binary,
             Format(LowerHex) => sym::new_lower_hex,
             Format(UpperHex) => sym::new_upper_hex,
-            Usize => sym::from_usize,
+            Usize => sym::new_count,
         },
     ));
     ctx.expr_call_mut(sp, new_fn, std::slice::from_ref(arg))
+}
+
+fn make_value<'hir>(
+    ctx: &mut LoweringContext<'_, 'hir>,
+    sp: Span,
+    arg: &'hir hir::Expr<'hir>,
+    ty: ArgumentType,
+) -> hir::Expr<'hir> {
+    let new_fn = ctx.arena.alloc(ctx.expr_lang_item_type_relative(
+        sp,
+        LangItem::FormatArgument,
+        match ty {
+            ArgumentType::Format(_) => sym::new,
+            ArgumentType::Usize => sym::from_usize,
+        },
+    ));
+    ctx.expr_call_mut(sp, new_fn, std::slice::from_ref(arg))
+}
+
+fn make_erased_array<'hir>(
+    ctx: &mut LoweringContext<'_, 'hir>,
+    macsp: Span,
+    arguments: &[FormatArgument],
+    argmap: &FxIndexMap<(usize, ArgumentType), Option<Span>>,
+    args_ident: Ident,
+    args_hir_id: hir::HirId,
+) -> &'hir hir::Expr<'hir> {
+    let elements =
+        ctx.arena.alloc_from_iter(argmap.iter().map(|(&(arg_index, ty), &placeholder_span)| {
+            if let Some(arg) = arguments.get(arg_index) {
+                let placeholder_span =
+                    placeholder_span.unwrap_or(arg.expr.span).with_ctxt(macsp.ctxt());
+                let arg_span = match arg.kind {
+                    FormatArgumentKind::Captured(_) => placeholder_span,
+                    _ => arg.expr.span.with_ctxt(macsp.ctxt()),
+                };
+                let args_ident_expr = ctx.expr_ident(macsp, args_ident, args_hir_id);
+                let arg = ctx.arena.alloc(ctx.expr(
+                    arg_span,
+                    hir::ExprKind::Field(
+                        args_ident_expr,
+                        Ident::new(sym::integer(arg_index), macsp),
+                    ),
+                ));
+                make_value(ctx, placeholder_span, arg, ty)
+            } else {
+                ctx.expr(
+                    macsp,
+                    hir::ExprKind::Err(
+                        ctx.dcx().span_delayed_bug(macsp, "missing format_args argument"),
+                    ),
+                )
+            }
+        }));
+    ctx.arena.alloc(ctx.expr(macsp, hir::ExprKind::Array(elements)))
+}
+
+fn make_format_list<'hir>(
+    ctx: &mut LoweringContext<'_, 'hir>,
+    macsp: Span,
+    arguments: &[FormatArgument],
+    argmap: &FxIndexMap<(usize, ArgumentType), Option<Span>>,
+    args_ident: Ident,
+    args_hir_id: hir::HirId,
+) -> &'hir hir::Expr<'hir> {
+    // Construct a zero-sized, type-level list. `FormatList::FORMATS` turns this into a static
+    // contiguous formatter array after monomorphization.
+    let mut list: &'hir hir::Expr<'hir> = ctx.arena.alloc(ctx.expr(macsp, hir::ExprKind::Tup(&[])));
+    for (tail_len, (&(arg_index, ty), &placeholder_span)) in argmap.iter().rev().enumerate() {
+        let Some(argument) = arguments.get(arg_index) else {
+            return ctx.arena.alloc(ctx.expr(
+                macsp,
+                hir::ExprKind::Err(
+                    ctx.dcx().span_delayed_bug(macsp, "missing format_args argument"),
+                ),
+            ));
+        };
+        let placeholder_span =
+            placeholder_span.unwrap_or(argument.expr.span).with_ctxt(macsp.ctxt());
+        let arg_span = match argument.kind {
+            FormatArgumentKind::Captured(_) => placeholder_span,
+            _ => argument.expr.span.with_ctxt(macsp.ctxt()),
+        };
+        let args_ident_expr = ctx.expr_ident(macsp, args_ident, args_hir_id);
+        let arg = ctx.arena.alloc(ctx.expr(
+            arg_span,
+            hir::ExprKind::Field(args_ident_expr, Ident::new(sym::integer(arg_index), macsp)),
+        ));
+        let marker = make_argument(ctx, placeholder_span, arg, ty);
+        let prepend =
+            ctx.expr_lang_item_type_relative(macsp, LangItem::FormatArgument, sym::prepend);
+        let hir::ExprKind::Path(hir::QPath::TypeRelative(prepend_ty, prepend_segment)) =
+            prepend.kind
+        else {
+            span_bug!(macsp, "format-list constructor was not a type-relative path");
+        };
+        let sizes = ctx.arena.alloc_from_iter([tail_len + 1, tail_len].map(|size| {
+            let value = ctx.arena.alloc(hir::ConstArg {
+                hir_id: ctx.next_id(),
+                kind: hir::ConstArgKind::Literal {
+                    lit: LitKind::Int((size as u128).into(), LitIntType::Unsuffixed),
+                    negated: false,
+                },
+                span: macsp,
+            });
+            hir::GenericArg::Const(value.try_as_ambig_ct().unwrap())
+        }));
+        let mut prepend_segment = *prepend_segment;
+        prepend_segment.args = Some(ctx.arena.alloc(hir::GenericArgs {
+            args: sizes,
+            constraints: &[],
+            parenthesized: hir::GenericArgsParentheses::No,
+            span_ext: macsp,
+        }));
+        prepend_segment.infer_args = true;
+        let prepend = ctx.arena.alloc(hir::Expr {
+            hir_id: prepend.hir_id,
+            kind: hir::ExprKind::Path(hir::QPath::TypeRelative(
+                prepend_ty,
+                ctx.arena.alloc(prepend_segment),
+            )),
+            span: prepend.span,
+        });
+        let call_args = ctx.arena.alloc_from_iter([marker, *list]);
+        list = ctx.arena.alloc(ctx.expr_call_mut(macsp, prepend, call_args));
+    }
+    list
 }
 
 /// Get the value for a `width` or `precision` field.
@@ -431,10 +559,14 @@ fn expand_format_args<'hir>(
 
     let arguments = fmt.arguments.all_args();
 
-    let (let_statements, args) = if arguments.is_empty() {
+    let (let_statements, args, formats) = if arguments.is_empty() {
         // Generate:
         //     []
-        (vec![], ctx.arena.alloc(ctx.expr(macsp, hir::ExprKind::Array(&[]))))
+        let args: &'hir hir::Expr<'hir> =
+            ctx.arena.alloc(ctx.expr(macsp, hir::ExprKind::Array(&[])));
+        let formats: &'hir hir::Expr<'hir> =
+            ctx.arena.alloc(ctx.expr(macsp, hir::ExprKind::Tup(&[])));
+        (vec![], args, formats)
     } else {
         // Generate:
         //     super let args = (&arg0, &arg1, &…);
@@ -450,55 +582,81 @@ fn expand_format_args<'hir>(
         let args_tuple = ctx.arena.alloc(ctx.expr(macsp, hir::ExprKind::Tup(elements)));
         let let_statement_1 = ctx.stmt_super_let_pat(macsp, args_pat, Some(args_tuple));
 
-        // Generate:
-        //     super let args = [
-        //         <core::fmt::Argument>::new_display(args.0),
-        //         <core::fmt::Argument>::new_lower_hex(args.1),
-        //         <core::fmt::Argument>::new_debug(args.0),
-        //         …
-        //     ];
-        let args = ctx.arena.alloc_from_iter(argmap.iter().map(
-            |(&(arg_index, ty), &placeholder_span)| {
-                if let Some(arg) = arguments.get(arg_index) {
-                    let placeholder_span =
-                        placeholder_span.unwrap_or(arg.expr.span).with_ctxt(macsp.ctxt());
-                    let arg_span = match arg.kind {
-                        FormatArgumentKind::Captured(_) => placeholder_span,
-                        _ => arg.expr.span.with_ctxt(macsp.ctxt()),
-                    };
-                    let args_ident_expr = ctx.expr_ident(macsp, args_ident, args_hir_id);
-                    let arg = ctx.arena.alloc(ctx.expr(
-                        arg_span,
-                        hir::ExprKind::Field(
-                            args_ident_expr,
-                            Ident::new(sym::integer(arg_index), macsp),
-                        ),
-                    ));
-                    make_argument(ctx, placeholder_span, arg, ty)
-                } else {
-                    ctx.expr(
-                        macsp,
-                        hir::ExprKind::Err(
-                            ctx.dcx().span_delayed_bug(macsp, "missing format_args argument"),
-                        ),
-                    )
-                }
-            },
-        ));
-        let args = ctx.arena.alloc(ctx.expr(macsp, hir::ExprKind::Array(args)));
-        let (args_pat, args_hir_id) = ctx.pat_ident(macsp, args_ident);
-        let let_statement_2 = ctx.stmt_super_let_pat(macsp, args_pat, Some(args));
-        (
-            vec![let_statement_1, let_statement_2],
-            ctx.arena.alloc(ctx.expr_ident_mut(macsp, args_ident, args_hir_id)),
-        )
+        let values = make_erased_array(ctx, macsp, arguments, &argmap, args_ident, args_hir_id);
+        let formats = make_format_list(ctx, macsp, arguments, &argmap, args_ident, args_hir_id);
+        let values_ident = Ident::new(sym::fmt_values, macsp);
+        let (values_pat, values_hir_id) = ctx.pat_ident(macsp, values_ident);
+        let let_statement_2 = ctx.stmt_super_let_pat(macsp, values_pat, Some(values));
+        let values: &'hir hir::Expr<'hir> =
+            ctx.arena.alloc(ctx.expr_ident_mut(macsp, values_ident, values_hir_id));
+        (vec![let_statement_1, let_statement_2], values, formats)
     };
 
-    // Generate:
-    //     unsafe {
-    //         <core::fmt::Arguments>::new(b"…", &args)
-    //     }
-    let template = ctx.expr_byte_str(macsp, ByteSymbol::intern(&bytecode));
+    // Pass the bytecode as a const generic so `new_descriptor` can select associated static data:
+    //     unsafe { Arguments::new(Arguments::new_descriptor::<_, N, M, BYTECODE>(formats), &args) }
+    let helper =
+        ctx.expr_lang_item_type_relative(macsp, LangItem::FormatArguments, sym::new_descriptor);
+    let hir::ExprKind::Path(hir::QPath::TypeRelative(ty, original_segment)) = helper.kind else {
+        span_bug!(macsp, "format descriptor constructor was not a type-relative path");
+    };
+    let length = ctx.arena.alloc(hir::ConstArg {
+        hir_id: ctx.next_id(),
+        kind: hir::ConstArgKind::Literal {
+            lit: LitKind::Int((bytecode.len() as u128).into(), LitIntType::Unsuffixed),
+            negated: false,
+        },
+        span: macsp,
+    });
+    let bytes = ctx.arena.alloc_from_iter(bytecode.iter().map(|&byte| {
+        &*ctx.arena.alloc(hir::ConstArg {
+            hir_id: ctx.next_id(),
+            kind: hir::ConstArgKind::Literal {
+                lit: LitKind::Int((byte as u128).into(), LitIntType::Unsuffixed),
+                negated: false,
+            },
+            span: macsp,
+        })
+    }));
+    let bytes = ctx.arena.alloc(hir::ConstArg {
+        hir_id: ctx.next_id(),
+        kind: hir::ConstArgKind::Array(
+            ctx.arena.alloc(hir::ConstArgArrayExpr { span: macsp, elems: bytes }),
+        ),
+        span: macsp,
+    });
+    let count = ctx.arena.alloc(hir::ConstArg {
+        hir_id: ctx.next_id(),
+        kind: hir::ConstArgKind::Literal {
+            lit: LitKind::Int((argmap.len() as u128).into(), LitIntType::Unsuffixed),
+            negated: false,
+        },
+        span: macsp,
+    });
+    let list_type = ctx.arena.alloc(hir::InferArg {
+        hir_id: ctx.next_id(),
+        span: macsp,
+        kind: hir::InferArgKind::TypeOrConst,
+    });
+    let generic_args = ctx.arena.alloc(hir::GenericArgs {
+        args: ctx.arena.alloc_from_iter([
+            hir::GenericArg::Infer(list_type),
+            hir::GenericArg::Const(length.try_as_ambig_ct().unwrap()),
+            hir::GenericArg::Const(count.try_as_ambig_ct().unwrap()),
+            hir::GenericArg::Const(bytes.try_as_ambig_ct().unwrap()),
+        ]),
+        constraints: &[],
+        parenthesized: hir::GenericArgsParentheses::No,
+        span_ext: macsp,
+    });
+    let mut segment = *original_segment;
+    segment.args = Some(generic_args);
+    segment.infer_args = false;
+    let helper = ctx.arena.alloc(hir::Expr {
+        hir_id: helper.hir_id,
+        kind: hir::ExprKind::Path(hir::QPath::TypeRelative(ty, ctx.arena.alloc(segment))),
+        span: helper.span,
+    });
+    let descriptor = ctx.expr_call_mut(macsp, helper, std::slice::from_ref(formats));
     let call = {
         let new = ctx.arena.alloc(ctx.expr_lang_item_type_relative(
             macsp,
@@ -506,7 +664,7 @@ fn expand_format_args<'hir>(
             sym::new,
         ));
         let args = ctx.expr_ref(macsp, args);
-        let new_args = ctx.arena.alloc_from_iter([template, args]);
+        let new_args = ctx.arena.alloc_from_iter([descriptor, args]);
         ctx.expr_call(macsp, new, new_args)
     };
     let call = hir::ExprKind::Block(
