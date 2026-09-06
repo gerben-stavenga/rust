@@ -12,7 +12,7 @@ use rustc_hir::{HirId, Target, find_attr};
 use rustc_middle::span_bug;
 use rustc_middle::ty::TyCtxt;
 use rustc_session::diagnostics::report_lit_error;
-use rustc_span::{DUMMY_SP, DesugaringKind, Ident, Span, Spanned, Symbol, respan, sym};
+use rustc_span::{ByteSymbol, DUMMY_SP, DesugaringKind, Ident, Span, Spanned, Symbol, respan, sym};
 use thin_vec::{ThinVec, thin_vec};
 use visit::{Visitor, walk_expr};
 
@@ -2067,6 +2067,14 @@ impl<'hir> LoweringContext<'_, 'hir> {
         let lit = hir::Lit {
             span: self.lower_span(sp),
             node: ast::LitKind::Str(value, ast::StrStyle::Cooked),
+        };
+        self.expr(sp, hir::ExprKind::Lit(lit))
+    }
+
+    pub(super) fn expr_byte_str(&mut self, sp: Span, value: ByteSymbol) -> hir::Expr<'hir> {
+        let lit = hir::Lit {
+            span: self.lower_span(sp),
+            node: ast::LitKind::ByteStr(value, ast::StrStyle::Cooked),
         };
         self.expr(sp, hir::ExprKind::Lit(lit))
     }

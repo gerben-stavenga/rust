@@ -4,9 +4,10 @@ use rustc_ast::*;
 use rustc_data_structures::fx::FxIndexMap;
 use rustc_hir as hir;
 use rustc_hir::attrs::lang_items::LangItem;
+use rustc_hir::def::DefKind;
 use rustc_middle::span_bug;
 use rustc_session::config::FmtDebug;
-use rustc_span::{DesugaringKind, Ident, Span, Symbol, sym};
+use rustc_span::{ByteSymbol, DesugaringKind, Ident, Span, Symbol, sym};
 
 use super::LoweringContext;
 
@@ -592,71 +593,84 @@ fn expand_format_args<'hir>(
         (vec![let_statement_1, let_statement_2], values, formats)
     };
 
-    // Pass the bytecode as a const generic so `new_descriptor` can select associated static data:
-    //     unsafe { Arguments::new(Arguments::new_descriptor::<_, N, M, BYTECODE>(formats), &args) }
-    let helper =
-        ctx.expr_lang_item_type_relative(macsp, LangItem::FormatArguments, sym::new_descriptor);
-    let hir::ExprKind::Path(hir::QPath::TypeRelative(ty, original_segment)) = helper.kind else {
-        span_bug!(macsp, "format descriptor constructor was not a type-relative path");
-    };
-    let length = ctx.arena.alloc(hir::ConstArg {
-        hir_id: ctx.next_id(),
-        kind: hir::ConstArgKind::Literal {
-            lit: LitKind::Int((bytecode.len() as u128).into(), LitIntType::Unsuffixed),
-            negated: false,
-        },
-        span: macsp,
-    });
-    let bytes = ctx.arena.alloc_from_iter(bytecode.iter().map(|&byte| {
-        &*ctx.arena.alloc(hir::ConstArg {
-            hir_id: ctx.next_id(),
-            kind: hir::ConstArgKind::Literal {
-                lit: LitKind::Int((byte as u128).into(), LitIntType::Unsuffixed),
-                negated: false,
-            },
-            span: macsp,
+    // Generate an inline const containing the bytecode literally. Its expected type ties the
+    // inferred formatter-list type to the static formatter array without making the bytecode a
+    // const generic:
+    //
+    //     Arguments::new_descriptor(
+    //         formats,
+    //         const { &Arguments::new_typed_descriptor::<_, N, M>(b"...") },
+    //     )
+    let const_node_id = ctx.next_node_id();
+    let const_def_id = ctx.create_def(const_node_id, None, DefKind::AnonConst, macsp);
+    let const_hir_id = ctx.lower_node_id(const_node_id);
+    let template = ByteSymbol::intern(&bytecode);
+    let descriptor_body = ctx.with_new_scopes(macsp, |ctx| {
+        ctx.lower_body(|ctx| {
+            let helper = ctx.expr_lang_item_type_relative(
+                macsp,
+                LangItem::FormatArguments,
+                sym::new_typed_descriptor,
+            );
+            let hir::ExprKind::Path(hir::QPath::TypeRelative(ty, original_segment)) = helper.kind
+            else {
+                span_bug!(macsp, "typed format descriptor constructor was not type-relative");
+            };
+            let const_args = [bytecode.len(), argmap.len()].map(|value| {
+                let value = ctx.arena.alloc(hir::ConstArg {
+                    hir_id: ctx.next_id(),
+                    kind: hir::ConstArgKind::Literal {
+                        lit: LitKind::Int((value as u128).into(), LitIntType::Unsuffixed),
+                        negated: false,
+                    },
+                    span: macsp,
+                });
+                hir::GenericArg::Const(value.try_as_ambig_ct().unwrap())
+            });
+            let list_type = ctx.arena.alloc(hir::InferArg {
+                hir_id: ctx.next_id(),
+                span: macsp,
+                kind: hir::InferArgKind::TypeOrConst,
+            });
+            let generic_args = ctx.arena.alloc(hir::GenericArgs {
+                args: ctx.arena.alloc_from_iter([
+                    hir::GenericArg::Infer(list_type),
+                    const_args[0],
+                    const_args[1],
+                ]),
+                constraints: &[],
+                parenthesized: hir::GenericArgsParentheses::No,
+                span_ext: macsp,
+            });
+            let mut segment = *original_segment;
+            segment.args = Some(generic_args);
+            segment.infer_args = false;
+            let helper = ctx.arena.alloc(hir::Expr {
+                hir_id: helper.hir_id,
+                kind: hir::ExprKind::Path(hir::QPath::TypeRelative(ty, ctx.arena.alloc(segment))),
+                span: helper.span,
+            });
+            let template = ctx.arena.alloc(ctx.expr_byte_str(macsp, template));
+            let typed = ctx.expr_call_mut(macsp, helper, std::slice::from_ref(template));
+            let typed = ctx.arena.alloc(typed);
+            (&[], ctx.expr_ref(macsp, typed))
         })
-    }));
-    let bytes = ctx.arena.alloc(hir::ConstArg {
-        hir_id: ctx.next_id(),
-        kind: hir::ConstArgKind::Array(
-            ctx.arena.alloc(hir::ConstArgArrayExpr { span: macsp, elems: bytes }),
-        ),
-        span: macsp,
     });
-    let count = ctx.arena.alloc(hir::ConstArg {
-        hir_id: ctx.next_id(),
-        kind: hir::ConstArgKind::Literal {
-            lit: LitKind::Int((argmap.len() as u128).into(), LitIntType::Unsuffixed),
-            negated: false,
-        },
-        span: macsp,
-    });
-    let list_type = ctx.arena.alloc(hir::InferArg {
-        hir_id: ctx.next_id(),
-        span: macsp,
-        kind: hir::InferArgKind::TypeOrConst,
-    });
-    let generic_args = ctx.arena.alloc(hir::GenericArgs {
-        args: ctx.arena.alloc_from_iter([
-            hir::GenericArg::Infer(list_type),
-            hir::GenericArg::Const(length.try_as_ambig_ct().unwrap()),
-            hir::GenericArg::Const(count.try_as_ambig_ct().unwrap()),
-            hir::GenericArg::Const(bytes.try_as_ambig_ct().unwrap()),
-        ]),
-        constraints: &[],
-        parenthesized: hir::GenericArgsParentheses::No,
-        span_ext: macsp,
-    });
-    let mut segment = *original_segment;
-    segment.args = Some(generic_args);
-    segment.infer_args = false;
-    let helper = ctx.arena.alloc(hir::Expr {
-        hir_id: helper.hir_id,
-        kind: hir::ExprKind::Path(hir::QPath::TypeRelative(ty, ctx.arena.alloc(segment))),
-        span: helper.span,
-    });
-    let descriptor = ctx.expr_call_mut(macsp, helper, std::slice::from_ref(formats));
+    let descriptor_const = ctx.arena.alloc(ctx.expr(
+        macsp,
+        hir::ExprKind::ConstBlock(hir::ConstBlock {
+            def_id: const_def_id,
+            hir_id: const_hir_id,
+            body: descriptor_body,
+        }),
+    ));
+    let select = ctx.arena.alloc(ctx.expr_lang_item_type_relative(
+        macsp,
+        LangItem::FormatArguments,
+        sym::new_descriptor,
+    ));
+    let descriptor_args = ctx.arena.alloc_from_iter([*formats, *descriptor_const]);
+    let descriptor = ctx.expr_call_mut(macsp, select, descriptor_args);
     let call = {
         let new = ctx.arena.alloc(ctx.expr_lang_item_type_relative(
             macsp,
