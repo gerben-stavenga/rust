@@ -992,7 +992,8 @@ const impl<T, A: [const] Allocator + [const] Destruct> Vec<T, A> {
     /// capacity after the push, *O*(*capacity*) time is taken to copy the
     /// vector's elements to a larger allocation. This expensive operation is
     /// offset by the *capacity* *O*(1) insertions it allows.
-    #[inline]
+    #[inline(always)]
+    #[rustc_diagnostic_item = "vec_push"]
     #[stable(feature = "rust1", since = "1.0.0")]
     #[rustc_confusables("push_back", "put", "append")]
     pub fn push(&mut self, value: T) {
@@ -1024,7 +1025,7 @@ const impl<T, A: [const] Allocator + [const] Destruct> Vec<T, A> {
     /// capacity after the push, *O*(*capacity*) time is taken to copy the
     /// vector's elements to a larger allocation. This expensive operation is
     /// offset by the *capacity* *O*(1) insertions it allows.
-    #[inline]
+    #[inline(always)]
     #[stable(feature = "push_mut", since = "1.95.0")]
     #[must_use = "if you don't need a reference to the value, use `Vec::push` instead"]
     pub fn push_mut(&mut self, value: T) -> &mut T {
@@ -1528,7 +1529,14 @@ impl<T, A: Allocator> Vec<T, A> {
     /// ```
     #[stable(feature = "try_reserve", since = "1.57.0")]
     pub fn try_reserve(&mut self, additional: usize) -> Result<(), TryReserveError> {
-        self.buf.try_reserve(self.len, additional)
+        let len = self.len;
+        let result = self.buf.try_reserve(len, additional);
+        unsafe {
+            // The buffer and its allocator cannot change the vector's length.
+            // Keep that fact visible when allocator operations are type-erased.
+            hint::assert_unchecked(self.len == len);
+        }
+        result
     }
 
     /// Tries to reserve the minimum capacity for at least `additional`
@@ -1571,7 +1579,12 @@ impl<T, A: Allocator> Vec<T, A> {
     /// ```
     #[stable(feature = "try_reserve", since = "1.57.0")]
     pub fn try_reserve_exact(&mut self, additional: usize) -> Result<(), TryReserveError> {
-        self.buf.try_reserve_exact(self.len, additional)
+        let len = self.len;
+        let result = self.buf.try_reserve_exact(len, additional);
+        unsafe {
+            hint::assert_unchecked(self.len == len);
+        }
+        result
     }
 
     /// Shrinks the capacity of the vector as much as possible.
