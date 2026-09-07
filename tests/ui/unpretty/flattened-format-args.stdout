@@ -11,10 +11,13 @@ fn main() {
     {
         ::std::io::_print({
                 super let args = (&x,);
-                super let args = [format_argument::new_display(args.0)];
+                super let fmt_values = [format_argument::new(args.0)];
                 unsafe {
-                    format_arguments::new(b"\x08a 123 b \xc0\x05 xyz\n\x00",
-                        &args)
+                    format_arguments::new(format_arguments::new_descriptor(format_argument::prepend::<1,
+                                    0>(format_argument::new_display(args.0), ()),
+                            const
+                                    &format_arguments::new_typed_descriptor::<_, 17,
+                                                1>(b"\x08a 123 b \xc0\x05 xyz\n\x00")), &fmt_values)
                 }
             });
     };
